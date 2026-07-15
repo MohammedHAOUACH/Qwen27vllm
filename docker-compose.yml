@@ -1,0 +1,101 @@
+services:
+  vllm:
+    image: nvcr.io/nvidia/vllm:26.06-py3
+    container_name: vllm-qwen36-27b-awq
+    restart: unless-stopped
+    # ipc: host requis pour tensor-parallel: vLLM/NCCL utilise la shared memory
+    # pour le broadcast entre workers. Le /dev/shm Docker par défaut (64MB)
+    # est insuffisant et provoque "No available shared memory broadcast block".
+    ipc: host
+    ports:
+      - "1234:1234"
+    volumes:
+      - ./models:/root/.cache/huggingface/hub
+    environment:
+      # Locale UTF-8: evite UnicodeDecodeError dans le cleanup torch/_ops.py
+      # qui masquait les vraies erreurs (le conteneur NVIDIA a LANG=POSIX par defaut)
+      - LANG=C.UTF-8
+      - LC_ALL=C.UTF-8
+      - PYTHONIOENCODING=utf-8
+      # RTX 3090 = capability 8.6, pas de NVLink entre cartes (custom_all_reduce deja desactive).
+      # Forcer P2P/IB off evite les hangs NCCL et stabilise tensor-parallel sur PCIe.
+      - NCCL_P2P_DISABLE=1
+      - NCCL_IB_DISABLE=1
+      # VLLM_SLEEP_WHEN_IDLE SUPPRIME: il endort le moteur apres inactivite,
+      # et le reveil + recompilation Triton (causal_conv1d, slot_mapping)
+      # causait un hang de plusieurs minutes et un pic a ~2 tok/s au 1er appel.
+      # On garde le moteur CHAUD en permanence pour un debit soutenu (~35 tok/s).
+      - VLLM_USE_DEEP_GEMM=0
+      - VLLM_USE_FLASHINFER_MOE_FP16=1
+      # FlashInfer sampler = sampling top-p/top-k sur GPU au lieu de CPU.
+      # RTX 3090 (CC 8.6) est supportee par FlashInfer (>=0.2.x). Active
+      # par defaut en V0.22.1+; on le force explicitement pour eviter la
+      # regression sur PyTorch sampler (~+15-20% tok/sec en decoding).
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      # 12 cores physiques (probablement 6 phys * 2 hyperthreads) avec
+      # 3 processus vLLM Python (EngineCore + Worker_TP0 + Worker_TP1).
+      # Test empirique A/B (tok/sec sur 500 tokens avec 27B AWQ + ctx 65k):
+      #   OMP=4 (1:1 thread/core): 26.75 tok/sec
+      #   OMP=8 (oversubscription):  30.53 tok/sec  <<< MEILLEUR
+      # PyTorch/NCCL profitent de l'oversubscription, scheduler OS OK.
+      - OMP_NUM_THREADS=8
+      - HF_TOKEN=${HF_TOKEN:-}
+      # VLLM_LOG_LEVEL=INFO en prod (DEBUG etait un flag de debug actif pendant le troubleshooting)
+      - VLLM_LOG_LEVEL=INFO
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2
+              capabilities: [gpu]
+    command:
+      - vllm
+      - serve
+      - --model
+      - QuantTrio/Qwen3.6-27B-AWQ
+      - --served-model-name
+      - qwen3.6-27b-awq
+      - --tensor-parallel-size
+      - "2"
+      # max-model-len = max_position_embeddings du modele (262144 = 256K tokens)
+      - --max-model-len
+      - "262144"
+      # ctx 256K = 1 seule sequence a la fois (47 GiB de KV > 24 GiB VRAM)
+      - --max-num-seqs
+      - "1"
+      # --swap-space a été supprimé dans vLLM 0.22.1, remplacé par kv-offloading
+      # Pas d'offloading KV sur CPU: contrainte "100% GPU, 0% CPU".
+      # Modele hybride (Mamba+Attn): seul le full-attention (16/64 couches)
+      # alloue du KV cache -> ~17 GiB a 262K tokens, largement dans la
+      # VRAM disponible avec gpu-memory-utilization=0.95. On supprime donc
+      # --kv-offloading-size et --kv-offloading-backend pour forcer 100% GPU.
+      # 0.95: on pousse au max pour tenir 100% du KV cache en VRAM et
+      # eliminer tout spillover CPU. Le modele est HYBRIDE (Mamba+Attn):
+      # seul 16/64 couches stockent du KV full-attention -> ~64 KiB/token
+      # -> ~17 GiB pour 262K tokens, largement dans la VRAM libre (~30 GiB
+      # sur 2x 3090). Plus de marge pour le CUDA graph capture a 256K.
+      - --gpu-memory-utilization
+      - "0.95"
+      # Qwen3.5 multimodal melange plusieurs types d'attention (standard +
+      # GDN linear). Le Hybrid KV cache manager est DESACTIVE par defaut
+      # (--disable-hybrid-kv-cache-manager=True) et cela provoque:
+      # "Hybrid KV cache manager is disabled but failed to convert the
+      # KV cache specs to one unified type". On l'ACTIVE explicitement.
+      - --no-disable-hybrid-kv-cache-manager
+      # Qwen3.5 est un modele "hybrid" (Mamba+Attention = GDN linear + std).
+      # vLLM exige --enable-prefix-caching pour aligner les block sizes:
+      # sinon: AssertionError: gpu_block_size=65536 not divisible by hash_block_size=3211264
+      - --enable-prefix-caching
+      - --trust-remote-code
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --reasoning-parser
+      - qwen3
+      # --speculative-config désactivé: le placeholder "<dflash draft>" n'est pas un modèle HF valide
+      # et consommerait de la VRAM additionnelle déjà très juste (48GB pour 27B AWQ + context 65k)
+      - --host
+      - 0.0.0.0
+      - --port
+      - "1234"
