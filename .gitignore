@@ -23,6 +23,7 @@ torch_compile_cache/
 __pycache__/
 *.pyc
 .cache/
+cache/
 
 # ─────────────────────────────────────────────
 # Logs & artefacts runtime

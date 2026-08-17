@@ -1,10 +1,13 @@
-# vLLM — Qwen3.6-27B-AWQ (serveur d'inférence)
+# vLLM — Qwen3.8-27B-INT8-W8A16-MTP (serveur d'inférence)
 
-Serveur d'inférence haute performance pour le modèle **QuantTrio/Qwen3.6-27B-AWQ**,
-déployé via [vLLM](https://github.com/vllm-project/vllm) en conteneur Docker.
+Serveur d'inférence haute performance pour le modèle
+**`lued/Qwen3.8-27B-INT8-W8A16-MTP`**, déployé via
+[vLLM](https://github.com/vllm-project/vllm) (image nightly épinglée) en
+conteneur Docker.
 
-> **Objectif atteint :** contexte maximal (256 K tokens) **100 % GPU, 0 % CPU** —
-> aucun spillover du KV cache vers la RAM, débit soutenu ~37 tok/s sur 2× RTX 3090.
+> **Objectif :** contexte maximal (256 K tokens) en VRAM pure sur 2× RTX 3090,
+> avec **MTP speculative decoding** (3 tokens spéculatifs, acceptation ~65 %,
+> débit **~58-70 tok/s**).
 
 ---
 
@@ -16,26 +19,31 @@ déployé via [vLLM](https://github.com/vllm-project/vllm) en conteneur Docker.
 - [Prérequis](#prérequis)
 - [Installation & lancement](#installation--lancement)
 - [Configuration détaillée](#configuration-détaillée)
-- [Optimisations (100 % GPU, max contexte)](#optimisations-100--gpu-max-contexte)
+- [Optimisations](#optimisations)
 - [Utilisation de l'API](#utilisation-de-lapi)
 - [Performances mesurées](#performances-mesurées)
 - [Dépannage](#dépannage)
 - [Notes & limitations](#notes--limitations)
+- [Structure du dépôt](#structure-du-dépôt)
 
 ---
 
 ## Vue d'ensemble
 
-Ce dépôt fournit un stack d'inférence prêt à l'emploi pour servir un modèle de
-langage de 27 milliards de paramètres (quantifié AWQ 4-bit) avec :
+Ce dépôt fournit une stack d'inférence prêt à l'emploi pour servir un modèle de
+langage de 27 milliards de paramètres (quantification **INT8 W8A16**) avec :
 
 - **Contexte maximal** de `262 144` tokens (256 K) — la limite native du modèle.
-- **Exécution 100 % GPU** : poids + KV cache intégralement en VRAM, aucun recours
-  au CPU pour le cache (pas de `--kv-offloading`, pas de `--swap-space`).
+- **KV cache en FP8** (`fp8_e4m3`, 1 octet/valeur) — indispensable pour tenir
+  256 K en VRAM sur 2× RTX 3090.
+- **MTP speculative decoding** — 3 tokens spéculatifs, acceptation mesurée
+  ~65 %, débit ~58-70 tok/s.
 - **Tensor Parallelism = 2** sur deux RTX 3090 (PCIe, sans NVLink).
-- **Sampling et attention sur GPU** (FlashInfer) — zéro pré/post-traitement sur CPU.
-- **Modèle hybride** (Mamba linear-attention + full-attention) qui rend le contexte
-  256 K viable en VRAM.
+- **Modèle hybride** (Mamba linear-attention + GDN + MTP) — le chemin
+  `Qwen3.8` requiert `--mamba-cache-mode align` et le spawn multiprocess.
+- **Thinking désactivé par défaut** (`enable_thinking: false`) — gain ~3-5× en
+  vitesse ; réactivable par requête via `reasoning_effort` ou
+  `chat_template_kwargs`.
 
 ---
 
@@ -43,22 +51,22 @@ langage de 27 milliards de paramètres (quantifié AWQ 4-bit) avec :
 
 | Élément | Valeur |
 |---|---|
-| GPU | 2 × NVIDIA RTX 3090 (compute capability **8.6**) |
+| GPU | 2 × NVIDIA RTX 3090 (compute capability **8.6**, Ampere) |
 | VRAM | 24 Go × 2 = **48 Go** total |
 | Interconnexion | PCIe (pas de NVLink) |
-| Modèle | `QuantTrio/Qwen3.6-27B-AWQ` |
-| Architecture | `Qwen3_5ForConditionalGeneration` (hybride Mamba + GDN linear-attention) |
-| Quantification | AWQ 4-bit (`awq_marlin` kernel) |
+| Modèle | `lued/Qwen3.8-27B-INT8-W8A16-MTP` |
+| Quantification | INT8 W8A16 (poids INT8 reconstruits en BF16, pas de FP8 natif sur sm_86) |
+| `dtype` servi | `bfloat16` |
+| KV cache dtype | `fp8_e4m3` (1 octet/valeur) |
 | Contexte max | `262 144` tokens (`max_position_embeddings`) |
-| vLLM | `0.22.1+7b9cb5b7.dev` (image `nvcr.io/nvidia/vllm:26.06-py3`) |
+| vLLM | image nightly `vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9` |
+| MTP | 3 tokens spéculatifs (`--speculative-config`) |
 
 **Pourquoi un contexte 256 K tient-il en VRAM ?**
-Le modèle est **hybride** : sur 64 couches, seules **16** sont en full-attention
+Le modèle est **hybride** : sur 64 couches, seules 16 sont en full-attention
 (les 48 autres utilisent une linear-attention de type Mamba qui n'alloue pas de
-KV cache classique). Le KV cache full-attention représente donc ~64 KiB/token →
-~17 GiB à 262 K tokens, largement dans la VRAM libre (~30 Go sur 2 GPU après les
-poids). Un modèle *dense* complet à 256 K aurait nécessité ~47 GiB de KV et aurait
-exigé un offload CPU — ici évité.
+KV cache classique). Combiné au **KV cache FP8** (2× plus compact que le FP16),
+le cache full-attention tient largement dans la VRAM libre après les poids.
 
 ---
 
@@ -72,25 +80,33 @@ exigé un offload CPU — ici évité.
 │        │                                                     │
 │        ▼                                                     │
 │   ┌─────────────────────────────────────────────────────┐   │
-│   │  Conteneur vllm-qwen36-27b-awq                       │   │
-│   │  (nvcr.io/nvidia/vllm:26.06-py3)                     │   │
+│   │  Conteneur vllm-qwen38-27b-int8                      │   │
+│   │  (vllm/vllm-openai:nightly-ac7509e2…)                │   │
 │   │                                                       │   │
 │   │   API Server  ──►  EngineCore  ──►  Worker TP0 (GPU0)│   │
 │   │   :1234                  │            Worker TP1 (GPU1)│   │
 │   │                          └─ NCCL (P2P/IB off) ────────┘   │
 │   │                                                       │   │
-│   │   KV cache : 100% VRAM (gpu-memory-utilization=0.95) │   │
+│   │   KV cache FP8  ·  MTP (3 tokens spéculatifs)         │   │
+│   │   gpu-memory-utilization = 0.92                       │   │
 │   └─────────────────────────────────────────────────────┘   │
-│        │ volume                                              │
+│        │ volumes                                              │
 │        ▼                                                     │
 │   ./models  ──►  /root/.cache/huggingface/hub               │
+│   ./cache/vllm  ──►  /root/.cache/vllm (torch.compile)      │
+│   ./cache/triton ──►  /root/.triton/cache                   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 - **Tensor Parallelism (TP=2)** : les couches du modèle sont scindées sur les 2 GPU.
-- **NCCL** en mode P2P/IB désactivé (stabilise le TP sur PCIe sans NVLink).
-- **Volumes** : les poids du modèle sont montés en lecture depuis `./models`
-  (cache HF local, pas de téléchargement réseau au démarrage).
+- **Pipeline Parallelism = 1** (single stage).
+- **NCCL** en mode P2P/IB désactivé (stabilise le TP sur PCIe sans NVLink) ;
+  `custom_all_reduce` également désactivé (non supporté sans P2P).
+- **Volumes** :
+  - `./models` → cache Hugging Face (poids, montés en lecture/écriture).
+  - `./cache/vllm` → artefacts de compilation `torch.compile`/Inductor
+    (évite de recompiler à chaque redémarrage, ~3-4 min économisées).
+  - `./cache/triton` → cache Triton (kernels).
 
 ---
 
@@ -120,11 +136,12 @@ cp .env.example .env
 # 2. Démarrer le serveur
 docker compose up -d
 
-# 3. Suivre le démarrage (compilation torch.compile + capture CUDA graph ~3-4 min)
+# 3. Suivre le démarrage (compilation torch.compile + capture CUDA graph ~3-4 min
+#    au premier lancement ; ~30 s ensuite grâce aux caches persistants)
 docker compose logs -f
 
 # 4. Vérifier la santé
-curl -s http://localhost:1234/health   # -> {"...ok..."} / HTTP 200
+curl -s http://localhost:1234/health   # -> HTTP 200
 
 # 5. Confirmer le modèle et le contexte max
 curl -s http://localhost:1234/v1/models | jq '.data[0].max_model_len'
@@ -144,47 +161,74 @@ docker compose down        # stoppe et supprime le conteneur
 
 | Paramètre | Valeur | Rôle |
 |---|---|---|
-| `image` | `nvcr.io/nvidia/vllm:26.06-py3` | vLLM 0.22.1 pré-build NVIDIA |
+| `image` | `vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9` | nightly épinglée (seule validée pour Qwen3.8 : Marlin + Mamba cache aligné + MTP) |
+| `container_name` | `vllm-qwen38-27b-int8` | — |
 | `ipc: host` | — | shared memory NCCL (évite *"No available shared memory broadcast block"*) |
 | `deploy.resources.devices` | `count: 2` | expose les 2 GPU au conteneur |
+| `--model` | `lued/Qwen3.8-27B-INT8-W8A16-MTP` | modèle servi |
+| `--served-model-name` | `qwen3.8-27b-int8-w8a16` | nom exposé via l'API |
 | `--tensor-parallel-size` | `2` | parallélisme sur 2 GPU |
+| `--pipeline-parallel-size` | `1` | single stage |
+| `--dtype` | `bfloat16` | Ampere sm_86 : W8A16 reconstruit en BF16 (pas de FP8 natif) |
+| `--performance-mode` | `balanced` | profil de performance vLLM |
 | `--max-model-len` | `262144` | contexte max natif du modèle |
-| `--max-num-seqs` | `1` | 1 seule séquence (contexte 256 K monopolise le KV) |
-| `--gpu-memory-utilization` | `0.95` | pousse le KV cache au max en VRAM |
-| `--no-disable-hybrid-kv-cache-manager` | — | requis pour les modèles hybrides |
-| `--enable-prefix-caching` | — | aligne les block sizes (obligatoire ici) |
+| `--gpu-memory-utilization` | `0.92` | marge pour la capture CUDA graph à 256 K |
+| `--max-num-seqs` | `2` | 2 séquences concurrentes (commande recommandée) |
+| `--max-num-batched-tokens` | `8192` | chunking des longs prompts (prefill) |
+| `--kv-cache-dtype` | `fp8_e4m3` | KV cache 1 octet/valeur — requis pour 256 K en VRAM |
+| `--no-enable-prefix-caching` | — | prefix caching OFF (corrompt le KV récurrent GDN+MTP, vllm#48375) |
+| `--enable-chunked-prefill` | — | prefill par lots pour les longs prompts |
+| `--mamba-cache-mode` | `align` | requis par le chemin MTP/GDN de Qwen3.8 |
+| `--prefix-match-unit` | `16` | alignement des block sizes |
+| `--enable-prompt-tokens-details` | — | détails de tokens par requête |
+| `--enable-per-request-metrics` | — | métriques par requête |
+| `--reasoning-parser` | `qwen3` | parsing du raisonnement natif Qwen3 |
+| `--tool-call-parser` | `qwen3_coder` | function calling |
+| `--enable-auto-tool-choice` | — | active le tool calling |
+| `--disable-custom-all-reduce` | — | désactive custom all-reduce (non supporté sans P2P/NVLink) |
 | `--trust-remote-code` | — | charge le code custom du modèle |
-| `--enable-auto-tool-choice` + `--tool-call-parser qwen3_coder` | — | function calling |
-| `--reasoning-parser qwen3` | — | parsing du raisonnement natif Qwen3 |
+| `--default-chat-template-kwargs` | `{"enable_thinking":false}` | thinking OFF par défaut (gain ~3-5×) |
+| `--override-generation-config` | `{"temperature":1.0,"top_p":0.95,"top_k":20,...}` | defaults de génération |
+| `--speculative-config` | `{"method":"mtp","num_speculative_tokens":3}` | MTP, 3 tokens spéculatifs |
 
 ### Variables d'environnement
 
 | Variable | Valeur | Effet |
 |---|---|---|
-| `LANG` / `LC_ALL` | `C.UTF-8` | évite les `UnicodeDecodeError` du conteneur NVIDIA (LANG=POSIX) |
+| `LANG` / `LC_ALL` / `PYTHONIOENCODING` | `C.UTF-8` / `utf-8` | évite les `UnicodeDecodeError` (conteneur en LANG=POSIX) |
 | `NCCL_P2P_DISABLE` / `NCCL_IB_DISABLE` | `1` | stabilise NCCL sur PCIe sans NVLink |
-| `VLLM_USE_FLASHINFER_SAMPLER` | `1` | sampling top-p/top-k **sur GPU** |
-| `VLLM_USE_DEEP_GEMM` | `0` | désactivé (non pertinent pour AWQ) |
-| `OMP_NUM_THREADS` | `8` | oversubscription validée empiriquement (+15 % tok/s) |
+| `NCCL_CUMEM_ENABLE` | `0` | désactive CUMEM (allocation CUDA classique) |
+| `VLLM_WORKER_MULTIPROC_METHOD` | `spawn` | requis par le chemin MTP/GDN de Qwen3.8 |
+| `OMP_NUM_THREADS` | `1` | 1 thread OMP (sampler FlashInfer désactivé pour ce pin) |
+| `VLLM_USE_FLASHINFER_SAMPLER` | `0` | sampler FlashInfer désactivé (recette modèle) |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True,max_split_size_mb:512` | allocation CUDA par segments extensibles |
 | `HF_TOKEN` | depuis `.env` | auth HF si besoin |
+| `VLLM_LOGGING_LEVEL` | `INFO` | niveau de log |
 
-> ⚠️ **`VLLM_SLEEP_WHEN_IDLE` a volontairement été supprimé.** Il endormait le
-> moteur après inactivité, causant un *hang* de plusieurs minutes et un pic de
-> latence (~2 tok/s) au premier appel suivant. Le moteur reste désormais **chaud**.
+> ⚠️ **`max-num-seqs=2`** est la commande recommandée, mais le multi-stream peut
+> encore crasher le moteur sur ce pin (`vllm#50021` non mergé). En cas
+> d'instabilité, descendre à `1` (= config pleinement validée).
 
 ---
 
-## Optimisations (100 % GPU, max contexte)
+## Optimisations
 
-1. **Aucun offload CPU** — suppression de `--kv-offloading-size` /
-   `--kv-offloading-backend` et de `--swap-space`. Tout le KV cache vit en VRAM.
-2. **`gpu-memory-utilization=0.95`** — maximise l'espace KV en VRAM tout en gardant
-   la marge pour la capture des CUDA graphs à 256 K.
-3. **FlashInfer partout** — sampler **et** attention exécutés sur GPU (RTX 3090
-   CC 8.6 supporté), éliminant la régression CPU du sampler PyTorch.
-4. **Modèle hybride exploité** — la linear-attention Mamba ne consomme pas de KV
+1. **KV cache FP8** (`fp8_e4m3`) — 1 octet/valeur au lieu de 2 (FP16), divisant
+   par 2 l'empreinte du KV cache et rendant le contexte 256 K tenable en VRAM.
+2. **MTP speculative decoding** — 3 tokens spéculatifs, acceptation ~65 %,
+   débit ~58-70 tok/s (vs ~37 tok/s sans MTP).
+3. **Caches de compilation persistants** — `./cache/vllm` et `./cache/triton`
+   évitent de recompiler `torch.compile`/Triton à chaque redémarrage.
+4. **Chunked prefill** (`--max-num-batched-tokens 8192`) — découpe les longs
+   prompts pour éviter l'OOM au prefill.
+5. **`gpu-memory-utilization=0.92`** — maximise l'espace KV en VRAM tout en
+   gardant la marge pour la capture des CUDA graphs à 256 K.
+6. **Modèle hybride exploité** — la linear-attention Mamba ne consomme pas de KV
    classique, ce qui rend le contexte 256 K tenable en VRAM pure.
-5. **Moteur toujours chaud** — pas de mise en veille, débit immédiat à chaque requête.
+7. **Thinking OFF par défaut** — `enable_thinking: false` pour un débit maximal ;
+   réactivable par requête via `reasoning_effort` ou `chat_template_kwargs`.
+8. **Allocation CUDA par segments extensibles** —
+   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512`.
 
 ---
 
@@ -198,7 +242,7 @@ Le serveur expose l'API OpenAI-compatible sur **`http://localhost:1234`**.
 curl -s http://localhost:1234/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.6-27b-awq",
+    "model": "qwen3.8-27b-int8-w8a16",
     "messages": [
       {"role": "user", "content": "Explique le parallélisme de données en 3 phrases."}
     ],
@@ -215,7 +259,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:1234/v1", api_key="vllm")
 
 resp = client.chat.completions.create(
-    model="qwen3.6-27b-awq",
+    model="qwen3.8-27b-int8-w8a16",
     messages=[{"role": "user", "content": "Bonjour, qui es-tu ?"}],
     max_tokens=512,
     temperature=0.6,
@@ -223,10 +267,27 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+### Réactiver le thinking par requête
+
+Le thinking est désactivé par défaut (`--default-chat-template-kwargs
+{"enable_thinking":false}`). Pour le réactiver sur une requête donnée :
+
+```bash
+curl -s http://localhost:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.8-27b-int8-w8a16",
+    "messages": [{"role": "user", "content": "Résous x^2 + 5x + 6 = 0."}],
+    "reasoning_effort": "low",
+    "chat_template_kwargs": {"enable_thinking": true}
+  }' | jq '.choices[0].message'
+```
+
 ### Test de charge utile (contexte long)
 
 Pour valider le contexte 256 K, envoyez un prompt de ~250 K tokens ; le serveur
-répondra tant que `max-num-seqs=1` est respecté (une séquence à la fois).
+répondra tant que `max-num-seqs` est respecté (1-2 séquences à la fois selon la
+config).
 
 ---
 
@@ -234,15 +295,17 @@ répondra tant que `max-num-seqs=1` est respecté (une séquence à la fois).
 
 | Métrique | Résultat |
 |---|---|
-| Débit soutenu (chaud) | **~37 tok/s** (150 tokens en ~4.1 s, stable sur N req) |
-| Débit au 1er appel (cold) | ~20 tok/s (capture CUDA graph initiale) |
+| Débit soutenu (chaud, MTP) | **~58-70 tok/s** (3 tokens spéculatifs, acceptation ~65 %) |
+| Débit sans MTP | ~37 tok/s |
+| 1er appel (cold) | plus lent (capture CUDA graph initiale, ~3-4 min au premier lancement) |
+| Redémarrages suivants | ~30 s (caches `./cache/vllm` + `./cache/triton` persistants) |
 | Utilisation GPU | **100 %** (les 2 cartes) |
-| VRAM utilisée | **~21.9 / 24.6 Go** par GPU (poids AWQ ~10 Go + KV ~11 Go) |
-| Offload CPU du KV | **Aucun** (0 % CPU pour le cache) |
+| KV cache | **FP8** (`fp8_e4m3`, 1 octet/valeur) |
 | Contexte max servi | 262 144 tokens |
 
-> Note : le modèle répond en mode *reasoning* (parser `qwen3`). Le contenu
-> apparaît dans le champ `reasoning` / en streaming — comportement attendu, pas un bug.
+> Note : le modèle répond en mode *reasoning* (parser `qwen3`) si le thinking est
+> activé. Le contenu apparaît alors dans le champ `reasoning` / en streaming —
+> comportement attendu, pas un bug.
 
 ---
 
@@ -251,27 +314,34 @@ répondra tant que `max-num-seqs=1` est respecté (une séquence à la fois).
 | Symptôme | Cause probable | Solution |
 |---|---|---|
 | *"No available shared memory broadcast block"* | `/dev/shm` Docker trop petit | Vérifier `ipc: host` dans le compose (déjà présent) |
-| *"Hybrid KV cache manager is disabled but failed to convert…"* | manager hybride désactivé | `--no-disable-hybrid-kv-cache-manager` (présent) |
-| `AssertionError: gpu_block_size=… not divisible by hash_block_size=…` | block sizes mal alignés | `--enable-prefix-caching` (présent) |
-| 1er appel très lent / hang | `VLLM_SLEEP_WHEN_IDLE` actif | Variable supprimée de la config |
-| OOM au démarrage | `gpu-memory-utilization` trop haut | baisser à `0.90` (ou réduire `max-model-len`) |
-| `Custom allreduce is disabled` (warning) | Pas de P2P NVLink sur 3090 | Normal ; NCCL utilisé à la place |
+| Crash / instabilité en multi-stream | `vllm#50021` non mergé | Descendre `--max-num-seqs` à `1` |
+| Corruption du KV récurrent (GDN+MTP) | prefix caching activé | `--no-enable-prefix-caching` (déjà présent) |
+| OOM au démarrage | `gpu-memory-utilization` trop haut | Baisser à `0.90` (ou réduire `--max-model-len`) |
+| OOM au prefill d'un long prompt | `max-num-batched-tokens` trop grand | Réduire `--max-num-batched-tokens` (8192 par défaut) |
+| `UnicodeDecodeError` dans `torch/_ops.py` | Locale POSIX dans le conteneur | `LANG=C.UTF-8` (déjà présent) |
+| Recompilation lente à chaque redémarrage | caches `./cache/vllm` absents | Vérifier les volumes `./cache/vllm` et `./cache/triton` |
+| `Custom allreduce is disabled` (warning) | Pas de P2P NVLink sur 3090 | Normal ; `--disable-custom-all-reduce` + NCCL utilisé |
 
 ---
 
 ## Notes & limitations
 
-- **`max-num-seqs=1`** : avec un contexte 256 K, une seule séquence peut être
-  traitée à la fois (le KV cache sature la VRAM). Pour du batching, réduisez
-  `--max-model-len`.
-- **Redémarrage lent** : la compilation `torch.compile` + capture CUDA graph
-  prennent ~3-4 min au premier lancement (cache persistant dans le conteneur).
-- **RTX 3090 (CC 8.6)** : `SymmMemCommunicator` et `custom_all_reduce` sont
-  désactivés (non supportés) — NCCL classique est utilisé, sans impact majeur.
-- **Image NVIDIA** : `VLLM_USE_FLASHINFER_MOE_FP16` est déprécié (remplacé par
-  `--moe-backend` en v0.23) — warning sans conséquence ici (modèle non-MoE).
-- Modèle **multimodal** (vision + texte) : le chat texte seul fonctionne ;
-  l'encodeur vision est initialisé (budget 16384 tokens) mais non sollicité.
+- **`max-num-seqs=2`** : la commande recommandée, mais le multi-stream peut
+  encore crasher le moteur sur ce pin (`vllm#50021` non mergé). En cas
+  d'instabilité, descendre à `1` (= config pleinement validée).
+- **Prefix caching désactivé** : sur GDN+MTP, le prefix caching peut corrompre
+  le KV récurrent (`vllm#48375`) sauf patch source. On le laisse désactivé.
+- **RTX 3090 (CC 8.6, Ampere)** : W8A16 = poids INT8 reconstruits en BF16 (pas
+  de FP8 natif) ; `custom_all_reduce` désactivé (non supporté) — NCCL classique
+  utilisé, sans impact majeur.
+- **Thinking OFF par défaut** : gain de ~3-5× en vitesse. Réactivable par
+  requête via `reasoning_effort` ou `chat_template_kwargs`.
+- **Image nightly épinglée** : `vllm/vllm-openai:nightly-ac7509e2…` est la seule
+  version validée pour Qwen3.8 (compressed-tensors Marlin + Mamba cache aligné +
+  MTP réunis). Ne pas changer d'image sans revalidation.
+- **Redémarrage** : ~3-4 min au premier lancement (compilation
+  `torch.compile` + capture CUDA graph) ; ~30 s ensuite grâce aux caches
+  persistants (`./cache/vllm`, `./cache/triton`).
 
 ---
 
@@ -279,8 +349,10 @@ répondra tant que `max-num-seqs=1` est respecté (une séquence à la fois).
 
 ```
 .
-├── docker-compose.yml   # Stack d'inférence vLLM (config optimisée)
+├── docker-compose.yml   # Stack d'inférence vLLM (config optimisée Qwen3.8)
 ├── .env.example         # Template de variables (HF_TOKEN)
 ├── .env                 # Variables réelles (non versionné)
 ├── models/              # Cache HF local des poids (monté en volume)
+├── cache/vllm/          # Cache torch.compile / Inductor (persistant)
+├── cache/triton/        # Cache Triton (kernels, persistant)
 └── README.md            # Ce document

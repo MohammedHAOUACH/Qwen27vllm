@@ -1,47 +1,43 @@
 services:
   vllm:
-    image: nvcr.io/nvidia/vllm:26.06-py3
-    container_name: vllm-qwen36-27b-awq
+    # Image nightly épinglée : seule version validée pour Qwen3.8 (compressed-tensors
+    # Marlin + Mamba cache aligné + MTP speculative decoding réunis).
+    # Source : carte modèle lued/Qwen3.8-27B-INT8-W8A16-MTP (section "Serving").
+    image: vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9
+    container_name: vllm-qwen38-27b-int8
     restart: unless-stopped
-    # ipc: host requis pour tensor-parallel: vLLM/NCCL utilise la shared memory
-    # pour le broadcast entre workers. Le /dev/shm Docker par défaut (64MB)
-    # est insuffisant et provoque "No available shared memory broadcast block".
+    # ipc: host requis pour tensor-parallel : vLLM/NCCL utilise la shared memory
+    # pour le broadcast entre workers (sinon "No available shared memory broadcast block").
     ipc: host
     ports:
       - "1234:1234"
     volumes:
+      # Poids du modèle (cache Hugging Face) — montés en lecture/écriture.
       - ./models:/root/.cache/huggingface/hub
+      # Persistance des artefacts de compilation (torch.compile / inductor / Triton)
+      # pour éviter de recompiler à chaque redémarrage (~3-4 min économisées).
+      - ./cache/vllm:/root/.cache/vllm
+      - ./cache/triton:/root/.triton/cache
     environment:
-      # Locale UTF-8: evite UnicodeDecodeError dans le cleanup torch/_ops.py
-      # qui masquait les vraies erreurs (le conteneur NVIDIA a LANG=POSIX par defaut)
+      # Locale UTF-8 : évite UnicodeDecodeError dans torch/_ops.py (conteneur NVIDIA en LANG=POSIX).
       - LANG=C.UTF-8
       - LC_ALL=C.UTF-8
       - PYTHONIOENCODING=utf-8
-      # RTX 3090 = capability 8.6, pas de NVLink entre cartes (custom_all_reduce deja desactive).
-      # Forcer P2P/IB off evite les hangs NCCL et stabilise tensor-parallel sur PCIe.
+      # 2× RTX 3090 sans NVLink : profil "stock driver" recommandé par la carte modèle.
+      # NCCL_P2P_DISABLE évite les stalls d'init NCCL ; --disable-custom-all-reduce (CLI)
+      # désactive le custom all-reduce vLLM non supporté sans P2P.
       - NCCL_P2P_DISABLE=1
       - NCCL_IB_DISABLE=1
-      # VLLM_SLEEP_WHEN_IDLE SUPPRIME: il endort le moteur apres inactivite,
-      # et le reveil + recompilation Triton (causal_conv1d, slot_mapping)
-      # causait un hang de plusieurs minutes et un pic a ~2 tok/s au 1er appel.
-      # On garde le moteur CHAUD en permanence pour un debit soutenu (~35 tok/s).
-      - VLLM_USE_DEEP_GEMM=0
-      - VLLM_USE_FLASHINFER_MOE_FP16=1
-      # FlashInfer sampler = sampling top-p/top-k sur GPU au lieu de CPU.
-      # RTX 3090 (CC 8.6) est supportee par FlashInfer (>=0.2.x). Active
-      # par defaut en V0.22.1+; on le force explicitement pour eviter la
-      # regression sur PyTorch sampler (~+15-20% tok/sec en decoding).
-      - VLLM_USE_FLASHINFER_SAMPLER=1
-      # 12 cores physiques (probablement 6 phys * 2 hyperthreads) avec
-      # 3 processus vLLM Python (EngineCore + Worker_TP0 + Worker_TP1).
-      # Test empirique A/B (tok/sec sur 500 tokens avec 27B AWQ + ctx 65k):
-      #   OMP=4 (1:1 thread/core): 26.75 tok/sec
-      #   OMP=8 (oversubscription):  30.53 tok/sec  <<< MEILLEUR
-      # PyTorch/NCCL profitent de l'oversubscription, scheduler OS OK.
-      - OMP_NUM_THREADS=8
+      - NCCL_CUMEM_ENABLE=0
+      # Multiprocess spawn : requis par le chemin MTP/GDN de Qwen3.8.
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      # Recette modèle : 1 seul thread OMP (le sampler FlashInfer est désactivé pour ce pin).
+      - OMP_NUM_THREADS=1
+      - VLLM_USE_FLASHINFER_SAMPLER=0
+      # Allocation CUDA recommandée par la carte modèle (segments extensibles).
+      - "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512"
       - HF_TOKEN=${HF_TOKEN:-}
-      # VLLM_LOG_LEVEL=INFO en prod (DEBUG etait un flag de debug actif pendant le troubleshooting)
-      - VLLM_LOG_LEVEL=INFO
+      - VLLM_LOGGING_LEVEL=INFO
     deploy:
       resources:
         reservations:
@@ -50,51 +46,65 @@ services:
               count: 2
               capabilities: [gpu]
     command:
-      - vllm
-      - serve
       - --model
-      - QuantTrio/Qwen3.6-27B-AWQ
+      - lued/Qwen3.8-27B-INT8-W8A16-MTP
       - --served-model-name
-      - qwen3.6-27b-awq
+      - qwen3.8-27b-int8-w8a16
       - --tensor-parallel-size
       - "2"
-      # max-model-len = max_position_embeddings du modele (262144 = 256K tokens)
+      - --pipeline-parallel-size
+      - "1"
+      # Ampere (sm_86) : W8A16 = poids INT8 reconstruits en BF16 (pas de FP8 natif).
+      - --dtype
+      - bfloat16
+      - --performance-mode
+      - balanced
+      # Contexte natif du modèle (262 144 tokens).
       - --max-model-len
       - "262144"
-      # ctx 256K = 1 seule sequence a la fois (47 GiB de KV > 24 GiB VRAM)
-      - --max-num-seqs
-      - "1"
-      # --swap-space a été supprimé dans vLLM 0.22.1, remplacé par kv-offloading
-      # Pas d'offloading KV sur CPU: contrainte "100% GPU, 0% CPU".
-      # Modele hybride (Mamba+Attn): seul le full-attention (16/64 couches)
-      # alloue du KV cache -> ~17 GiB a 262K tokens, largement dans la
-      # VRAM disponible avec gpu-memory-utilization=0.95. On supprime donc
-      # --kv-offloading-size et --kv-offloading-backend pour forcer 100% GPU.
-      # 0.95: on pousse au max pour tenir 100% du KV cache en VRAM et
-      # eliminer tout spillover CPU. Le modele est HYBRIDE (Mamba+Attn):
-      # seul 16/64 couches stockent du KV full-attention -> ~64 KiB/token
-      # -> ~17 GiB pour 262K tokens, largement dans la VRAM libre (~30 GiB
-      # sur 2x 3090). Plus de marge pour le CUDA graph capture a 256K.
       - --gpu-memory-utilization
-      - "0.95"
-      # Qwen3.5 multimodal melange plusieurs types d'attention (standard +
-      # GDN linear). Le Hybrid KV cache manager est DESACTIVE par defaut
-      # (--disable-hybrid-kv-cache-manager=True) et cela provoque:
-      # "Hybrid KV cache manager is disabled but failed to convert the
-      # KV cache specs to one unified type". On l'ACTIVE explicitement.
-      - --no-disable-hybrid-kv-cache-manager
-      # Qwen3.5 est un modele "hybrid" (Mamba+Attention = GDN linear + std).
-      # vLLM exige --enable-prefix-caching pour aligner les block sizes:
-      # sinon: AssertionError: gpu_block_size=65536 not divisible by hash_block_size=3211264
-      - --enable-prefix-caching
-      - --trust-remote-code
-      - --enable-auto-tool-choice
-      - --tool-call-parser
-      - qwen3_coder
+      - "0.92"
+      # Concurrence : 2 seqs = commande recommandée. ⚠️ Le multi-stream peut encore
+      # crasher le moteur sur ce pin (vllm#50021 non mergé) ; si instabilité,
+      # descendre à 1 (= config pleinement validée).
+      - --max-num-seqs
+      - "2"
+      # Plafonne le prefill par lots (chunking des longs prompts) — validé à 8192.
+      - --max-num-batched-tokens
+      - "8192"
+      # KV cache FP8 E4M3 (1 octet/valeur) — requis pour tenir 256K en VRAM.
+      - --kv-cache-dtype
+      - fp8_e4m3
+      # Prefix caching OFF par défaut : sur GDN+MTP il peut corrompre le KV récurrent
+      # (vllm#48375) sauf patch source. On le laisse désactivé.
+      - --no-enable-prefix-caching
+      - --enable-chunked-prefill
+      # Requis par le chemin MTP/GDN de Qwen3.8.
+      - --mamba-cache-mode
+      - align
+      - --prefix-match-unit
+      - "16"
+      - --enable-prompt-tokens-details
+      - --enable-per-request-metrics
       - --reasoning-parser
       - qwen3
-      # --speculative-config désactivé: le placeholder "<dflash draft>" n'est pas un modèle HF valide
-      # et consommerait de la VRAM additionnelle déjà très juste (48GB pour 27B AWQ + context 65k)
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-auto-tool-choice
+      # Désactive custom_all_reduce (non supporté sans P2P/NVLink sur 3090).
+      - --disable-custom-all-reduce
+      - --trust-remote-code
+      # Thinking OFF par défaut (gain de ~3-5× en vitesse).
+      # Par requête, le client peut activer un thinking réduit via :
+      #   "reasoning_effort": "low"   ou
+      #   "chat_template_kwargs": {"enable_thinking": true}
+      - --default-chat-template-kwargs
+      - '{"enable_thinking":false}'
+      - --override-generation-config
+      - '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"repetition_penalty":1.0,"presence_penalty":0.0}'
+      # MTP : 3 tokens spéculatifs (acceptation mesurée ~65 %, débit ~58-70 tok/s).
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3}'
       - --host
       - 0.0.0.0
       - --port
