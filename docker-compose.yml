@@ -76,9 +76,10 @@ services:
       # KV cache FP8 E4M3 (1 octet/valeur) — requis pour tenir 256K en VRAM.
       - --kv-cache-dtype
       - fp8_e4m3
-      # Prefix caching OFF par défaut : sur GDN+MTP il peut corrompre le KV récurrent
-      # (vllm#48375) sauf patch source. On le laisse désactivé.
-      - --no-enable-prefix-caching
+      # Prefix caching REACTIVE (test) : avec le contexte qui grossit a chaque
+      # etape, le re-prefill integral etait le goulot (~4 min/requete).
+      # ⚠️ vllm#48375 : risque de corruption du KV recurrent GDN+MTP — a surveiller.
+      - --enable-prefix-caching
       - --enable-chunked-prefill
       # Requis par le chemin MTP/GDN de Qwen3.8.
       - --mamba-cache-mode
