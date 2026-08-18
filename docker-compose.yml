@@ -31,7 +31,8 @@ services:
       - NCCL_CUMEM_ENABLE=0
       # Multiprocess spawn : requis par le chemin MTP/GDN de Qwen3.8.
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
-      # Recette modèle : 1 seul thread OMP (le sampler FlashInfer est désactivé pour ce pin).
+      # Recette modèle : 1 seul thread OMP, sampler FlashInfer désactivé.
+      # A/B testé : VLLM_USE_FLASHINFER_SAMPLER=1 ne change rien au débit (~42-45 tok/s).
       - OMP_NUM_THREADS=1
       - VLLM_USE_FLASHINFER_SAMPLER=0
       # Allocation CUDA recommandée par la carte modèle (segments extensibles).
@@ -102,7 +103,8 @@ services:
       - '{"enable_thinking":false}'
       - --override-generation-config
       - '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"repetition_penalty":1.0,"presence_penalty":0.0}'
-      # MTP : 3 tokens spéculatifs (acceptation mesurée ~65 %, débit ~58-70 tok/s).
+      # MTP : 3 tokens spéculatifs (acceptation mesurée ~65 %, débit ~42-45 tok/s mesuré).
+      # A/B testé : 2 tokens = ~10 % plus lent (~40 tok/s). Garder 3.
       - --speculative-config
       - '{"method":"mtp","num_speculative_tokens":3}'
       - --host

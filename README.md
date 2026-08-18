@@ -7,7 +7,7 @@ conteneur Docker.
 
 > **Objectif :** contexte maximal (256 K tokens) en VRAM pure sur 2× RTX 3090,
 > avec **MTP speculative decoding** (3 tokens spéculatifs, acceptation ~65 %,
-> débit **~58-70 tok/s**).
+> débit **~42-45 tok/s** mesuré).
 
 ---
 
@@ -37,7 +37,7 @@ langage de 27 milliards de paramètres (quantification **INT8 W8A16**) avec :
 - **KV cache en FP8** (`fp8_e4m3`, 1 octet/valeur) — indispensable pour tenir
   256 K en VRAM sur 2× RTX 3090.
 - **MTP speculative decoding** — 3 tokens spéculatifs, acceptation mesurée
-  ~65 %, débit ~58-70 tok/s.
+  ~65 %, débit ~42-45 tok/s (mesuré).
 - **Tensor Parallelism = 2** sur deux RTX 3090 (PCIe, sans NVLink).
 - **Modèle hybride** (Mamba linear-attention + GDN + MTP) — le chemin
   `Qwen3.8` requiert `--mamba-cache-mode align` et le spawn multiprocess.
@@ -189,7 +189,7 @@ docker compose down        # stoppe et supprime le conteneur
 | `--trust-remote-code` | — | charge le code custom du modèle |
 | `--default-chat-template-kwargs` | `{"enable_thinking":false}` | thinking OFF par défaut (gain ~3-5×) |
 | `--override-generation-config` | `{"temperature":1.0,"top_p":0.95,"top_k":20,...}` | defaults de génération |
-| `--speculative-config` | `{"method":"mtp","num_speculative_tokens":3}` | MTP, 3 tokens spéculatifs |
+| `--speculative-config` | `{"method":"mtp","num_speculative_tokens":3}` | MTP, 3 tokens spéculatifs (A/B testé : 2 tokens = ~10 % plus lent, ~40 tok/s — garder 3) |
 
 ### Variables d'environnement
 
@@ -200,7 +200,7 @@ docker compose down        # stoppe et supprime le conteneur
 | `NCCL_CUMEM_ENABLE` | `0` | désactive CUMEM (allocation CUDA classique) |
 | `VLLM_WORKER_MULTIPROC_METHOD` | `spawn` | requis par le chemin MTP/GDN de Qwen3.8 |
 | `OMP_NUM_THREADS` | `1` | 1 thread OMP (sampler FlashInfer désactivé pour ce pin) |
-| `VLLM_USE_FLASHINFER_SAMPLER` | `0` | sampler FlashInfer désactivé (recette modèle) |
+| `VLLM_USE_FLASHINFER_SAMPLER` | `0` | sampler FlashInfer désactivé (recette modèle ; A/B testé : `=1` ne change rien au débit, ~42-45 tok/s) |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True,max_split_size_mb:512` | allocation CUDA par segments extensibles |
 | `HF_TOKEN` | depuis `.env` | auth HF si besoin |
 | `VLLM_LOGGING_LEVEL` | `INFO` | niveau de log |
@@ -216,7 +216,8 @@ docker compose down        # stoppe et supprime le conteneur
 1. **KV cache FP8** (`fp8_e4m3`) — 1 octet/valeur au lieu de 2 (FP16), divisant
    par 2 l'empreinte du KV cache et rendant le contexte 256 K tenable en VRAM.
 2. **MTP speculative decoding** — 3 tokens spéculatifs, acceptation ~65 %,
-   débit ~58-70 tok/s (vs ~37 tok/s sans MTP).
+   débit ~42-45 tok/s mesuré (vs ~37 tok/s sans MTP). A/B testé :
+   2 tokens = ~10 % plus lent (~40 tok/s) — 3 reste le point optimal.
 3. **Caches de compilation persistants** — `./cache/vllm` et `./cache/triton`
    évitent de recompiler `torch.compile`/Triton à chaque redémarrage.
 4. **Chunked prefill** (`--max-num-batched-tokens 8192`) — découpe les longs
@@ -295,7 +296,7 @@ config).
 
 | Métrique | Résultat |
 |---|---|
-| Débit soutenu (chaud, MTP) | **~58-70 tok/s** (3 tokens spéculatifs, acceptation ~65 %) |
+| Débit soutenu (chaud, MTP) | **~42-45 tok/s** (mesuré, 3 tokens spéculatifs, acceptation ~65 %) |
 | Débit sans MTP | ~37 tok/s |
 | 1er appel (cold) | plus lent (capture CUDA graph initiale, ~3-4 min au premier lancement) |
 | Redémarrages suivants | ~30 s (caches `./cache/vllm` + `./cache/triton` persistants) |
