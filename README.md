@@ -21,6 +21,7 @@ conteneur Docker.
 - [Configuration détaillée](#configuration-détaillée)
 - [Optimisations](#optimisations)
 - [Utilisation de l'API](#utilisation-de-lapi)
+- [Interface web (Open WebUI)](#interface-web-open-webui)
 - [Performances mesurées](#performances-mesurées)
 - [Dépannage](#dépannage)
 - [Notes & limitations](#notes--limitations)
@@ -292,6 +293,37 @@ config).
 
 ---
 
+## Interface web (Open WebUI)
+
+En complément de l'API brute, la stack embarque [Open WebUI](https://github.com/open-webui/open-webui),
+une interface web auto-hébergée (chat, RAG, multi-utilisateurs) branchée sur
+l'API OpenAI-compatible vLLM.
+
+- **Accès :** <http://localhost:3000>
+- **API utilisée :** `http://vllm:1234/v1` (résolue via le réseau Docker interne).
+- **Modèle servi :** `qwen3.8-27b-int8-w8a16` (détecté automatiquement depuis
+  `/v1/models`).
+- **Données :** persistées dans le volume Docker `open-webui` (comptes,
+  conversations, fichiers RAG).
+
+```bash
+# Démarre vLLM + Open WebUI
+docker compose up -d
+
+# Ouvrir http://localhost:3000
+```
+
+> ⚠️ **Démarrage différé :** vLLM met ~3-4 min à se compiler au premier
+> lancement. Open WebUI démarre immédiatement mais le modèle n'apparaît dans la
+> liste qu'une fois vLLM prêt (Open WebUI interroge `/v1/models` en boucle).
+> Suivre la progression avec `docker compose logs -f vllm`.
+
+**Première connexion :** créez un compte local (le premier utilisateur devient
+administrateur). Open WebUI est 100 % hors-ligne — aucune donnée ne sort du
+réseau local.
+
+---
+
 ## Performances mesurées
 
 | Métrique | Résultat |
@@ -350,10 +382,15 @@ config).
 
 ```
 .
-├── docker-compose.yml   # Stack d'inférence vLLM (config optimisée Qwen3.8)
+├── docker-compose.yml   # Stack d'inférence vLLM + interface Open WebUI
 ├── .env.example         # Template de variables (HF_TOKEN)
 ├── .env                 # Variables réelles (non versionné)
 ├── models/              # Cache HF local des poids (monté en volume)
 ├── cache/vllm/          # Cache torch.compile / Inductor (persistant)
 ├── cache/triton/        # Cache Triton (kernels, persistant)
 └── README.md            # Ce document
+```
+
+> Le volume nommé `open-webui` (données de l'interface web) est géré par Docker
+> (`docker volume ls | grep open-webui`) — il n'apparaît pas comme dossier du
+> dépôt.

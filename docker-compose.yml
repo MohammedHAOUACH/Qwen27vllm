@@ -112,3 +112,28 @@ services:
       - 0.0.0.0
       - --port
       - "1234"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Interface web (Open WebUI) : chat + RAG, connectée à l'API OpenAI-compatible
+  # vLLM via le réseau Docker interne (service « vllm »).
+  # Source : https://docs.vllm.ai/en/latest/deployment/frameworks/open-webui/
+  # ─────────────────────────────────────────────────────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    volumes:
+      # Persistance des données (comptes, conversations, fichiers RAG).
+      - open-webui:/app/backend/data
+    environment:
+      # URL de base de l'API OpenAI-compatible vLLM (résolue via le réseau Docker).
+      - OPENAI_API_BASE_URL=http://vllm:1234/v1
+      # Clé arbitraire : vLLM n'authentifie pas, mais Open WebUI en exige une.
+      - OPENAI_API_KEY=vllm
+    depends_on:
+      - vllm
+
+volumes:
+  open-webui:
