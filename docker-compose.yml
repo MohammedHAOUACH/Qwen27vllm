@@ -1,9 +1,9 @@
 services:
   vllm:
-    # Image nightly épinglée : seule version validée pour Qwen3.8 (compressed-tensors
-    # Marlin + Mamba cache aligné + MTP speculative decoding réunis).
-    # Source : carte modèle lued/Qwen3.8-27B-INT8-W8A16-MTP (section "Serving").
-    image: vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9
+    # Image vLLM construite localement avec le support DFlash2 (PR vllm#52816,
+    # non mergée) : speculative decoding par block-diffusion (drafter séparé).
+    # À construire une fois avec : ./build-dflash-image.sh
+    image: vllm-openai:dflash2-pr52816
     container_name: vllm-qwen38-27b-int8
     restart: unless-stopped
     # ipc: host requis pour tensor-parallel : vLLM/NCCL utilise la shared memory
@@ -29,7 +29,7 @@ services:
       - NCCL_P2P_DISABLE=1
       - NCCL_IB_DISABLE=1
       - NCCL_CUMEM_ENABLE=0
-      # Multiprocess spawn : requis par le chemin MTP/GDN de Qwen3.8.
+      # Multiprocess spawn : requis par le chemin GDN/Mamba de Qwen3.8.
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       # Recette modèle : 1 seul thread OMP, sampler FlashInfer désactivé.
       # A/B testé : VLLM_USE_FLASHINFER_SAMPLER=1 ne change rien au débit (~42-45 tok/s).
@@ -47,6 +47,9 @@ services:
               count: 2
               capabilities: [gpu]
     command:
+      # Modèle cible (vérifieur). On garde l'INT8 W8A16 : c'est la seule version
+      # 27B qui tient en 48 Go (2× 3090). Ses têtes MTP sont chargées mais
+      # inutilisées tant que method=dflash (le drafter DFlash2 les remplace).
       - --model
       - lued/Qwen3.8-27B-INT8-W8A16-MTP
       - --served-model-name
@@ -60,9 +63,12 @@ services:
       - bfloat16
       - --performance-mode
       - balanced
-      # Contexte natif du modèle (262 144 tokens).
+      # Contexte max : réduit de 262144 → 98304 car le drafter DFlash2 séparé
+      # (~3.9 Go BF16) ne laisse que ~2.7 GiB de KV cache par GPU (2× 24 Go) ;
+      # vLLM estime ~98 880 tokens max avec cette config. Pour revenir à 256 K,
+      # il faudrait libérer de la VRAM (ex. ne pas charger les têtes MTP).
       - --max-model-len
-      - "262144"
+      - "98304"
       - --gpu-memory-utilization
       - "0.92"
       # Concurrence : 2 seqs = commande recommandée. ⚠️ Le multi-stream peut encore
@@ -78,10 +84,10 @@ services:
       - fp8_e4m3
       # Prefix caching REACTIVE (test) : avec le contexte qui grossit a chaque
       # etape, le re-prefill integral etait le goulot (~4 min/requete).
-      # ⚠️ vllm#48375 : risque de corruption du KV recurrent GDN+MTP — a surveiller.
+      # ⚠️ vllm#48375 : risque de corruption du KV recurrent GDN — a surveiller.
       - --enable-prefix-caching
       - --enable-chunked-prefill
-      # Requis par le chemin MTP/GDN de Qwen3.8.
+      # Requis par le chemin GDN/Mamba de Qwen3.8 (modèle cible hybride).
       - --mamba-cache-mode
       - align
       - --prefix-match-unit
@@ -104,10 +110,15 @@ services:
       - '{"enable_thinking":false}'
       - --override-generation-config
       - '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"repetition_penalty":1.0,"presence_penalty":0.0}'
-      # MTP : 3 tokens spéculatifs (acceptation mesurée ~65 %, débit ~42-45 tok/s mesuré).
-      # A/B testé : 2 tokens = ~10 % plus lent (~40 tok/s). Garder 3.
+      # DFlash2 : speculative decoding par block-diffusion. Le drafter
+      # z-lab/Qwen3.8-27B-DFlash2 (~1.9B param BF16, ~3.9 Go, téléchargé depuis
+      # HF au 1er démarrage) propose un bloc de tokens en un seul passage ;
+      # 7 tokens spéculatifs par étape (block_size 8). Décodage lossless.
+      # method=dflash : le speculator DFlash2 est sélectionné automatiquement
+      # car l'architecture du drafter est DFlash2DraftModel.
+      # Source : https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2
       - --speculative-config
-      - '{"method":"mtp","num_speculative_tokens":3}'
+      - '{"method":"dflash","model":"z-lab/Qwen3.8-27B-DFlash2","num_speculative_tokens":7}'
       - --host
       - 0.0.0.0
       - --port
