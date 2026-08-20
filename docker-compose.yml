@@ -3,7 +3,7 @@ services:
     # Image nightly épinglée : seule version validée pour Qwen3.8 (compressed-tensors
     # Marlin + Mamba cache aligné + MTP speculative decoding réunis).
     # Source : carte modèle lued/Qwen3.8-27B-INT8-W8A16-MTP (section "Serving").
-    image: vllm/vllm-openai:nightly-ac7509e2b1db40fec2f03dde1ed4e9dfdc2338c9
+    image: vllm/vllm-openai:nightly
     container_name: vllm-qwen38-27b-int8
     restart: unless-stopped
     # ipc: host requis pour tensor-parallel : vLLM/NCCL utilise la shared memory
