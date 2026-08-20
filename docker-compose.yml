@@ -63,12 +63,13 @@ services:
       - bfloat16
       - --performance-mode
       - balanced
-      # Contexte max : réduit de 262144 → 98304 car le drafter DFlash2 séparé
-      # (~3.9 Go BF16) ne laisse que ~2.7 GiB de KV cache par GPU (2× 24 Go) ;
-      # vLLM estime ~98 880 tokens max avec cette config. Pour revenir à 256 K,
-      # il faudrait libérer de la VRAM (ex. ne pas charger les têtes MTP).
+      # Contexte max réellement servable (mesuré) : 121 952 tokens.
+      # Le natif de Qwen3.8 (262 144) ne tient pas : avec le drafter DFlash2
+      # séparé (~3.9 Go BF16), il ne reste que ~3.15 GiB de KV cache par GPU
+      # (2× 24 Go) alors qu'il en faudrait 5.84 GiB pour 256 K. vLLM estime le
+      # max à 121 952 tokens ; au-delà il refuse de démarrer (ValueError).
       - --max-model-len
-      - "98304"
+      - "121952"
       - --gpu-memory-utilization
       - "0.92"
       # Concurrence : 2 seqs = commande recommandée. ⚠️ Le multi-stream peut encore
